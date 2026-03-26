@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+env/
+.venv/
+venv/
+pip-wheel-metadata/
+
+# VSCode / Windows
+.vscode/
+Thumbs.db
+Desktop.ini
+
+# Virtualenv and builds
+build/
+dist/
+
+# Logs and results
+result/
+*.log
+
+# Bytecode
+*.pyc
+
+# IDE
+.idea/
+
+# YCSB and other local data
+ycsb/
+
+# OS files
+.DS_Store
+
