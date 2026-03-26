@@ -168,6 +168,176 @@ class PromotionWorker:
             return 0
     
     def _demote_batch(self, keys_batch):
+        """
+        [IMPROVE] Demote nhiều keys trong một pipeline.
+        Phase đọc (HGETALL hot data) cũng được pipeline để tránh N round-trips.
+        Giúp tăng tốc độ dọn dẹp (evict) khi HOT tier bị áp lực bộ nhớ.
+        """
+        if not keys_batch:
+            return 0
+        
+        try:
+            # ==========================================
+            # Phase 1: Pipeline toàn bộ HGETALL để đọc HOT data
+            # ==========================================
+            read_pipe = self.redis_client.pipeline()
+            demote_keys = []
+            
+            for key, from_tier, to_tier in keys_batch:
+                if from_tier == 'hot' and to_tier == 'cold':
+                    read_pipe.hgetall(f"data:hot:{key}")
+                    demote_keys.append((key, to_tier))
+            
+            if not demote_keys:
+                return 0
+                
+            hash_data_list = read_pipe.execute()
+            
+            # ==========================================
+            # Phase 2: Nén data (CPU) và build Write Pipeline
+            # ==========================================
+            write_pipe = self.redis_client.pipeline()
+            valid_keys = []
+            compressed_sizes = {}
+            
+            for (key, to_tier), hash_data in zip(demote_keys, hash_data_list):
+                if not hash_data:
+                    continue
+                    
+                # Decode từ bytes sang string an toàn
+                hash_dict = {
+                    k.decode('utf-8') if isinstance(k, bytes) else str(k): 
+                    v.decode('utf-8') if isinstance(v, bytes) else str(v) 
+                    for k, v in hash_data.items()
+                }
+                
+                # Nén dữ liệu
+                compressed = self.compressor.compress(hash_dict)
+                
+                # Đưa lệnh ghi và xóa vào pipeline
+                write_pipe.set(f"data:cold:{key}", compressed)
+                write_pipe.delete(f"data:hot:{key}")
+                
+                # Tính toán kích thước để thống kê
+                original_size = sum(len(str(k).encode('utf-8')) + len(str(v).encode('utf-8')) for k, v in hash_dict.items())
+                compressed_size = len(compressed)
+                
+                valid_keys.append((key, to_tier, compressed_size, original_size - compressed_size))
+                compressed_sizes[key] = compressed_size
+            
+            # ==========================================
+            # Phase 3: Thực thi Write Pipeline và Cập nhật TierManager
+            # ==========================================
+            if valid_keys:
+                write_pipe.execute()
+                
+                # Cập nhật sổ cái và thống kê
+                for key, to_tier, compressed_size, bytes_saved in valid_keys:
+                    self.tier_manager.set_key_size(key, compressed_size)
+                    self.tier_manager.update_tier(key, to_tier)
+                    
+                    self.stats['keys_demoted'] += 1
+                    self.stats['keys_compressed'] += 1
+                    self.stats['bytes_saved'] += bytes_saved
+                    
+                    if self.log_file and not self.log_file.closed:
+                        comp_size = compressed_sizes.get(key, 0)
+                        self.log_file.write(f"{key} -> demotion (background worker: HOT -> COLD, compressed, {comp_size} bytes, batched)\n")
+                
+                if self.log_file and not self.log_file.closed:
+                    self.log_file.flush()
+            
+            return len(valid_keys)
+            
+        except Exception as e:
+            if "closed file" not in str(e):
+                print(f"Batch demotion error ({len(keys_batch)} keys): {e}")
+            return 0
+        """
+        [IMPROVE] Demote nhiều keys trong một pipeline.
+        Phase đọc (HGETALL hot data) cũng được pipeline để tránh N round-trips.
+        Giúp tăng tốc độ dọn dẹp (evict) khi HOT tier bị áp lực bộ nhớ.
+        """
+        if not keys_batch:
+            return 0
+        
+        try:
+            # ==========================================
+            # Phase 1: Pipeline toàn bộ HGETALL để đọc HOT data
+            # ==========================================
+            read_pipe = self.redis_client.pipeline()
+            demote_keys = []
+            
+            for key, from_tier, to_tier in keys_batch:
+                if from_tier == 'hot' and to_tier == 'cold':
+                    read_pipe.hgetall(f"data:hot:{key}")
+                    demote_keys.append((key, to_tier))
+            
+            if not demote_keys:
+                return 0
+                
+            hash_data_list = read_pipe.execute()
+            
+            # ==========================================
+            # Phase 2: Nén data (CPU) và build Write Pipeline
+            # ==========================================
+            write_pipe = self.redis_client.pipeline()
+            valid_keys = []
+            compressed_sizes = {}
+            
+            for (key, to_tier), hash_data in zip(demote_keys, hash_data_list):
+                if not hash_data:
+                    continue
+                    
+                # Decode từ bytes sang string an toàn
+                hash_dict = {
+                    k.decode('utf-8') if isinstance(k, bytes) else str(k): 
+                    v.decode('utf-8') if isinstance(v, bytes) else str(v) 
+                    for k, v in hash_data.items()
+                }
+                
+                # Nén dữ liệu
+                compressed = self.compressor.compress(hash_dict)
+                
+                # Đưa lệnh ghi và xóa vào pipeline
+                write_pipe.set(f"data:cold:{key}", compressed)
+                write_pipe.delete(f"data:hot:{key}")
+                
+                # Tính toán kích thước để thống kê
+                original_size = sum(len(str(k).encode('utf-8')) + len(str(v).encode('utf-8')) for k, v in hash_dict.items())
+                compressed_size = len(compressed)
+                
+                valid_keys.append((key, to_tier, compressed_size, original_size - compressed_size))
+                compressed_sizes[key] = compressed_size
+            
+            # ==========================================
+            # Phase 3: Thực thi Write Pipeline và Cập nhật TierManager
+            # ==========================================
+            if valid_keys:
+                write_pipe.execute()
+                
+                # Cập nhật sổ cái và thống kê
+                for key, to_tier, compressed_size, bytes_saved in valid_keys:
+                    self.tier_manager.set_key_size(key, compressed_size)
+                    self.tier_manager.update_tier(key, to_tier)
+                    
+                    self.stats['keys_demoted'] += 1
+                    self.stats['keys_compressed'] += 1
+                    self.stats['bytes_saved'] += bytes_saved
+                    
+                    if self.log_file and not self.log_file.closed:
+                        comp_size = compressed_sizes.get(key, 0)
+                        self.log_file.write(f"{key} -> demotion (background worker: HOT -> COLD, compressed, {comp_size} bytes, batched)\n")
+                
+                if self.log_file and not self.log_file.closed:
+                    self.log_file.flush()
+            
+            return len(valid_keys)
+            
+        except Exception as e:
+            if "closed file" not in str(e):
+                print(f"Batch demotion error ({len(keys_batch)} keys): {e}")
+            return 0
         """Demote multiple keys in one pipeline"""
         if not keys_batch:
             return 0

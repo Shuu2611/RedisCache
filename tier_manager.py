@@ -78,10 +78,32 @@ class TierManager:
     def classify_tier(self, key):
         if key not in self.key_stats:
             return 'cold'
+            
+        if self.key_stats[key]['count'] < 3:
+            return 'cold'
+            
         score = self.calculate_score(key)
         return 'hot' if score >= self.SCORE_THRESHOLD else 'cold'
 
     def should_promote(self, key, current_tier):
+        if current_tier == 'hot':
+            return False, 'hot', 'already_hot'
+
+        with self.lock:
+            if key not in self.key_stats or self.key_stats[key]['count'] < 3:
+                return False, 'cold', 'insufficient_hits'
+
+            now = time.time()
+            score = self._calculate_score_unlocked(key, now)
+            if score < self.SCORE_THRESHOLD:
+                return False, 'cold', 'below_threshold'
+
+            key_size = self.key_stats[key]['size']
+            hot_memory = self.stats['hot_memory_bytes']
+            if hot_memory + key_size > self.HOT_MAX_MEMORY_BYTES:
+                return False, 'cold', 'hot_memory_full'
+
+        return True, 'hot', 'threshold_met'
         if current_tier == 'hot':
             return False, 'hot', 'already_hot'
 
@@ -108,13 +130,13 @@ class TierManager:
             seconds_since = time.time() - self.key_stats[key]['last_access']
 
             # [IMPROVE] Demotion có 2 điều kiện thay vì chỉ timeout 150s:
-            # 1. Key idle > DEMOTION_IDLE_SECONDS VÀ HOT đang chịu áp lực (>80%)
-            # 2. Key idle > 2× threshold thì demote bất kể áp lực (dọn dẹp)
+            # 1. Key idle > DEMOTION_IDLE_SECONDS VÀ HOT đang chịu lượng WL (>85%)
+            # 2. Key idle > 2× threshold thì demote bất kể lượng WL
             hot_pressure = (
                 self.stats['hot_memory_bytes'] / self.HOT_MAX_MEMORY_BYTES
             ) if self.HOT_MAX_MEMORY_BYTES > 0 else 0
 
-            if seconds_since > self.DEMOTION_IDLE_SECONDS and hot_pressure > 0.9:
+            if seconds_since > self.DEMOTION_IDLE_SECONDS and hot_pressure > 0.85:
                 return True, 'cold'
 
             if seconds_since > self.DEMOTION_IDLE_SECONDS * 2:

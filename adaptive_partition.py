@@ -7,28 +7,31 @@ class AdaptivePartitioner:
         self.tier_manager = tier_manager
         self.log_file = log_file
 
-        # Cost model đã được calibrate
-        self.C_HOT = 500    # μs - Redis HGETALL + proxy overhead
-        self.C_COLD = 700   # μs - Redis GET + decompress + proxy overhead
-        self.C_MISS = 5400  # μs - MongoDB + proxy overhead
+        self.C_HOT = 500    
+        self.C_COLD = 700   
+        self.C_MISS = 5400  
 
         self.STEP_SIZE_PERCENT = 1
         self.MIN_HOT_PERCENT = 5
         self.MAX_HOT_PERCENT = 30
 
-        # [IMPROVED] Thread-Local Counters thay vì Global Lock
-        # Mỗi thread sẽ có một dictionary đếm riêng biệt
         self._init_lock = threading.Lock()
-        self.thread_stats = {} # Map từ thread_id -> dictionary stats
+        self.thread_stats = {} # Các bộ đếm cứ tăng mãi mãi (Monotonic)
+        
+        # Dùng Snapshot thay vì reset về 0 để tránh TOCTOU
+        self.snapshot = {
+            'total': 0,
+            'hot': 0,
+            'cold': 0,
+            'miss': 0
+        }
         self.last_reset = time.time()
         self.adjustment_history = []
 
     def _get_local_stats(self):
-        """Lấy hoặc khởi tạo bộ đếm riêng cho thread hiện tại."""
         tid = threading.get_ident()
         stats = self.thread_stats.get(tid)
         
-        # Chỉ dùng lock khi khởi tạo lần đầu cho một thread mới
         if stats is None:
             with self._init_lock:
                 if tid not in self.thread_stats:
@@ -42,10 +45,9 @@ class AdaptivePartitioner:
         return stats
 
     def record_request(self, tier):
-        """Ghi nhận kết quả request — siêu tốc, lock-free trên hot path."""
+        """Ghi nhận lock-free. Các số này chỉ TĂNG, không bao giờ bị set về 0"""
         stats = self._get_local_stats()
         
-        # Chỉ thread hiện tại mới ghi vào biến stats này nên không lo race condition
         stats['total_requests'] += 1
         if tier == 'hot':
             stats['hot_hits'] += 1
@@ -53,36 +55,36 @@ class AdaptivePartitioner:
             stats['cold_hits'] += 1
         else:
             stats['misses'] += 1
-    
-    def calculate_cost(self, hot_hit_rate, cold_hit_rate):
-        """Calculate total cost based on hit rates"""
-        miss_rate = 1.0 - hot_hit_rate - cold_hit_rate
-        cost = (hot_hit_rate * self.C_HOT + 
-                cold_hit_rate * self.C_COLD + 
-                miss_rate * self.C_MISS)
-        return cost
-    
-    def get_current_hit_rates(self):
-        """Tính hit rates bằng cách gom (aggregate) tất cả các thread-local counters."""
-        total = 0
-        hot = 0
-        cold = 0
-        miss = 0
-        
-        # list() để tránh lỗi runtime nếu có thread mới được thêm vào lúc đang lặp
+            
+    def _get_absolute_totals(self):
+        """Hàm phụ trợ lấy tổng tích lũy từ lúc server chạy"""
+        total, hot, cold, miss = 0, 0, 0, 0
         for stats in list(self.thread_stats.values()):
             total += stats['total_requests']
             hot += stats['hot_hits']
             cold += stats['cold_hits']
             miss += stats['misses']
+        return total, hot, cold, miss
+    
+    def calculate_cost(self, hot_hit_rate, cold_hit_rate):
+        miss_rate = 1.0 - hot_hit_rate - cold_hit_rate
+        return (hot_hit_rate * self.C_HOT + 
+                cold_hit_rate * self.C_COLD + 
+                miss_rate * self.C_MISS)
+    
+    def get_current_hit_rates(self):
+        """Tính hit rates dựa trên Delta (Hiện tại - Snapshot)"""
+        abs_total, abs_hot, abs_cold, abs_miss = self._get_absolute_totals()
+        
+        delta_total = abs_total - self.snapshot['total']
+        delta_hot = abs_hot - self.snapshot['hot']
+        delta_cold = abs_cold - self.snapshot['cold']
+        delta_miss = abs_miss - self.snapshot['miss']
             
-        if total == 0:
+        if delta_total <= 0:
             return 0.0, 0.0, 0.0
             
-        hot_rate = hot / total
-        cold_rate = cold / total
-        miss_rate = miss / total
-        return hot_rate, cold_rate, miss_rate
+        return (delta_hot / delta_total), (delta_cold / delta_total), (delta_miss / delta_total)
     
     def estimate_hit_rates_after_adjustment(self, current_hot_percent, new_hot_percent):
         hot_rate, cold_rate, miss_rate = self.get_current_hit_rates()
@@ -121,10 +123,11 @@ class AdaptivePartitioner:
         return new_hot_rate, new_cold_rate, new_miss_rate
     
     def adaptive_partition(self):
-        """SlimCache Algorithm 1: Adaptive Partitioning"""
-        # Phải gom tổng request trước khi kiểm tra ngưỡng < 1000
-        total_requests = sum(s['total_requests'] for s in list(self.thread_stats.values()))
-        if total_requests < 1000:
+        # Tính delta total để xem chu kỳ này đã nhận đủ 1000 requests chưa
+        abs_total, _, _, _ = self._get_absolute_totals()
+        delta_total = abs_total - self.snapshot['total']
+        
+        if delta_total < 1000:
             return False
         
         current_hot_percent = self.tier_manager.HOT_MEMORY_PERCENT
@@ -168,7 +171,6 @@ class AdaptivePartitioner:
         return False
     
     def _apply_adjustment(self, new_hot_percent, action, old_cost, new_cost):
-        """Apply the new partition boundary"""
         old_hot_percent = self.tier_manager.HOT_MEMORY_PERCENT
         
         self.tier_manager.HOT_MEMORY_PERCENT = new_hot_percent
@@ -199,7 +201,6 @@ class AdaptivePartitioner:
             self.log_file.flush()
     
     def _log_decision(self, hot_percent, cost, action):
-        """Log decision to maintain current partition"""
         hot_rate, cold_rate, miss_rate = self.get_current_hit_rates()
         msg = (f"[ADAPTIVE] MAINTAIN HOT tier at {hot_percent}% "
                f"(cost: {cost:.1f}μs, hot:{hot_rate*100:.1f}%, cold:{cold_rate*100:.1f}%, miss:{miss_rate*100:.1f}%)")
@@ -210,16 +211,20 @@ class AdaptivePartitioner:
             self.log_file.flush()
     
     def _reset_stats(self):
-        """Reset request stats bằng cách clear số đếm của tất cả threads."""
-        for stats in list(self.thread_stats.values()):
-            stats['total_requests'] = 0
-            stats['hot_hits'] = 0
-            stats['cold_hits'] = 0
-            stats['misses'] = 0
+        """
+        Thay vì zero-out các dict của thread khác (gây lỗi TOCTOU),
+        chỉ cần chốt sổ (snapshot) số liệu tuyệt đối ở thời điểm hiện tại.
+        """
+        abs_total, abs_hot, abs_cold, abs_miss = self._get_absolute_totals()
+        
+        self.snapshot['total'] = abs_total
+        self.snapshot['hot'] = abs_hot
+        self.snapshot['cold'] = abs_cold
+        self.snapshot['miss'] = abs_miss
+        
         self.last_reset = time.time()
     
     def get_statistics(self):
-        """Get adaptive partitioning statistics"""
         return {
             'adjustments': len(self.adjustment_history),
             'current_hot_percent': self.tier_manager.HOT_MEMORY_PERCENT,

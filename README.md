@@ -295,7 +295,7 @@ d:\test2/
 ├── benchmark.py           # YCSB benchmark runner
 ├── redis_proxy.py         # Tiered cache proxy server
 ├── tier_manager.py        # Phân loại tầng + quản lý bộ nhớ
-├── compression.py         # Nén LZ4/zlib
+├── cache_compression.py   # Nén LZ4/zlib
 ├── promotion.py           # Worker thăng/giáng hạng nền
 ├── requirements.txt       # Python dependencies
 ├── README.md             # File này

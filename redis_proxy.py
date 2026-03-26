@@ -13,7 +13,7 @@ from collections import OrderedDict
 import traceback
 
 from tier_manager import TierManager
-from compression import create_compressor, estimate_size
+from cache_compression import create_compressor, estimate_size
 from promotion import PromotionWorker
 from adaptive_partition import AdaptivePartitioner
 
@@ -237,7 +237,7 @@ class TieredCacheProxy:
         else:
             normalized = hash_data
 
-        # Dùng hàm estimate_size từ compression.py (json-based, chính xác hơn)
+        # Dùng hàm estimate_size từ cache_compression.py (json-based, chính xác hơn)
         size = estimate_size(normalized)
 
         if key:

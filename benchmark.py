@@ -14,7 +14,7 @@ class TieredCacheBenchmark:
         self.RECORD_COUNT = 60000
         self.OPERATION_COUNT = 500000
         self.WORKLOAD_TYPE = 'C'
-        self.COMPRESSION_ALGORITHM = 'zlib'
+        self.COMPRESSION_ALGORITHM = 'lz4'
         self.HOT_MEMORY_PERCENT = 10
         self.TOTAL_MEMORY_MB = 200
         
@@ -222,7 +222,7 @@ class TieredCacheBenchmark:
             '-p', 'zipfianconstant=1.5',
             '-p', 'redis.host=localhost',
             '-p', 'redis.port=6380',
-            '-p', 'redis.timeout=10000'  # 10s timeout to handle large workloads
+            '-p', 'redis.timeout=20000'  # 20s timeout to handle large workloads
         ]
         
         start = time.time()
