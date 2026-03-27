@@ -16,9 +16,16 @@ class AdaptivePartitioner:
         self.MAX_HOT_PERCENT = 30
 
         self._init_lock = threading.Lock()
-        self.thread_stats = {} # Các bộ đếm cứ tăng mãi mãi (Monotonic)
+        self.thread_stats = {} 
         
-        # Dùng Snapshot thay vì reset về 0 để tránh TOCTOU
+        # Bộ đếm gom số liệu của các luồng đã chết (chống tụt số đếm)
+        self.retired_stats = {
+            'total_requests': 0,
+            'hot_hits': 0,
+            'cold_hits': 0,
+            'misses': 0
+        }
+        
         self.snapshot = {
             'total': 0,
             'hot': 0,
@@ -29,6 +36,7 @@ class AdaptivePartitioner:
         self.adjustment_history = []
 
     def _get_local_stats(self):
+        """khởi tạo bộ đếm riêng cho thread hiện tại."""
         tid = threading.get_ident()
         stats = self.thread_stats.get(tid)
         
@@ -45,7 +53,7 @@ class AdaptivePartitioner:
         return stats
 
     def record_request(self, tier):
-        """Ghi nhận lock-free. Các số này chỉ TĂNG, không bao giờ bị set về 0"""
+        """Ghi nhận siêu tốc, lock-free."""
         stats = self._get_local_stats()
         
         stats['total_requests'] += 1
@@ -57,13 +65,38 @@ class AdaptivePartitioner:
             stats['misses'] += 1
             
     def _get_absolute_totals(self):
-        """Hàm phụ trợ lấy tổng tích lũy từ lúc server chạy"""
-        total, hot, cold, miss = 0, 0, 0, 0
+        """
+        Lấy tổng tích lũy, đồng thời cleanup các thread đã chết.
+        """
+        # 1. Lấy danh sách ID của các luồng ĐANG SỐNG trong hệ thống
+        active_tids = {t.ident for t in threading.enumerate()}
+        
+        with self._init_lock:
+            # 2. Tìm các luồng đã chết (có trong dict nhưng không có trong active_tids)
+            dead_tids = [tid for tid in self.thread_stats.keys() if tid not in active_tids]
+            
+            # 3. Cộng dồn di sản của chúng vào retired_stats và xóa khỏi bộ nhớ
+            for tid in dead_tids:
+                dead_stats = self.thread_stats.pop(tid)
+                self.retired_stats['total_requests'] += dead_stats['total_requests']
+                self.retired_stats['hot_hits'] += dead_stats['hot_hits']
+                self.retired_stats['cold_hits'] += dead_stats['cold_hits']
+                self.retired_stats['misses'] += dead_stats['misses']
+        
+        # 4. Bắt đầu tính tổng: Khởi tạo bằng số liệu của các luồng đã nghỉ
+        total = self.retired_stats['total_requests']
+        hot = self.retired_stats['hot_hits']
+        cold = self.retired_stats['cold_hits']
+        miss = self.retired_stats['misses']
+        
+        # 5. Cộng thêm số liệu của các luồng đang chạy
+        # (Dùng list() để tránh lỗi dictionary changed size during iteration)
         for stats in list(self.thread_stats.values()):
             total += stats['total_requests']
             hot += stats['hot_hits']
             cold += stats['cold_hits']
             miss += stats['misses']
+            
         return total, hot, cold, miss
     
     def calculate_cost(self, hot_hit_rate, cold_hit_rate):

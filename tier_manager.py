@@ -6,13 +6,12 @@ import threading
 
 class TierManager:
 
-    SCORE_THRESHOLD = 20
+    SCORE_THRESHOLD = 25
     HOT_MEMORY_PERCENT = 5
     TOTAL_REDIS_MEMORY_MB = 100
     WEIGHT_FREQUENCY = 0.8
     WEIGHT_RECENCY = 0.2
 
-    # [IMPROVE] Tăng từ 60s lên 90s. Hardcode 60s quá nhạy với Zipfian workload
     DEMOTION_IDLE_SECONDS = 90
 
     def __init__(self, hot_memory_percent=5, total_memory_mb=100,
@@ -56,7 +55,7 @@ class TierManager:
             if size_bytes > 0 and size_bytes != old_size:
                 stats['size'] = size_bytes
                 delta = size_bytes - old_size
-                # FIX #3: Cập nhật đúng tier hiện tại của key
+                #Cập nhật đúng tier hiện tại của key
                 if old_tier == 'hot':
                     self.stats['hot_memory_bytes'] = max(0, self.stats['hot_memory_bytes'] + delta)
                 else:
@@ -90,7 +89,7 @@ class TierManager:
             return False, 'hot', 'already_hot'
 
         with self.lock:
-            if key not in self.key_stats or self.key_stats[key]['count'] < 3:
+            if key not in self.key_stats or self.key_stats[key]['count'] < 5:
                 return False, 'cold', 'insufficient_hits'
 
             now = time.time()
@@ -129,7 +128,7 @@ class TierManager:
                 return False, 'hot'
             seconds_since = time.time() - self.key_stats[key]['last_access']
 
-            # [IMPROVE] Demotion có 2 điều kiện thay vì chỉ timeout 150s:
+            #Demotion có 2 điều kiện thay vì chỉ timeout 150s:
             # 1. Key idle > DEMOTION_IDLE_SECONDS VÀ HOT đang chịu lượng WL (>85%)
             # 2. Key idle > 2× threshold thì demote bất kể lượng WL
             hot_pressure = (
@@ -151,7 +150,7 @@ class TierManager:
             self.key_stats[key]['tier'] = new_tier
 
             if old_tier != new_tier:
-                # FIX #3: Bảo vệ bằng max(0,...) để tránh giá trị âm
+                # Bảo vệ bằng max(0,...) để tránh giá trị âm
                 if old_tier == 'hot':
                     self.stats['hot_memory_bytes'] = max(0, self.stats['hot_memory_bytes'] - key_size)
                 else:
@@ -183,7 +182,7 @@ class TierManager:
                 tier = self.key_stats[key]['tier']
                 delta = size_bytes - old_size
                 self.key_stats[key]['size'] = size_bytes
-                # FIX #3: Cập nhật memory accounting khi thay đổi size
+                #Cập nhật memory accounting khi thay đổi size
                 if tier == 'hot':
                     self.stats['hot_memory_bytes'] = max(0, self.stats['hot_memory_bytes'] + delta)
                 else:

@@ -18,7 +18,7 @@ from promotion import PromotionWorker
 from adaptive_partition import AdaptivePartitioner
 
 
-# FIX #7: LRU cache thay thế unbounded dict
+# LRU cache thay thế unbounded dict
 class LRUSizeCache:
     """Thread-safe LRU cache với giới hạn kích thước."""
     def __init__(self, maxsize=10000):
@@ -48,7 +48,7 @@ class LRUSizeCache:
 
 class TieredCacheProxy:
 
-    # FIX #10: Buffer log, chỉ flush định kỳ thay vì mỗi request
+    #Buffer log, chỉ flush định kỳ thay vì mỗi request
     LOG_FLUSH_INTERVAL = 2.0  # giây
 
     def __init__(self, proxy_port=6380, redis_host='localhost', redis_port=6379,
@@ -78,7 +78,7 @@ class TieredCacheProxy:
 
         self.executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix='proxy')
 
-        # FIX #7: Dùng LRU cache giới hạn thay vì unbounded dict
+        #Dùng LRU cache giới hạn thay vì unbounded dict
         self.size_cache = LRUSizeCache(maxsize=10000)
 
         print(f"Tiered cache proxy initialized:")
@@ -195,7 +195,17 @@ class TieredCacheProxy:
                 field = _to_str(command[2])
                 value = _to_str(command[3])
                 return self._handle_write(key, field, value)
-
+            elif cmd == 'HMSET':
+                # HMSET key field1 value1 field2 value2 ...
+                if len(command) < 4 or (len(command) - 2) % 2 != 0:
+                    return self.encode_error("ERR wrong number of arguments for HMSET")
+    
+                key = _to_str(command[1])
+                fields = {}
+                for i in range(2, len(command), 2):
+                    fields[_to_str(command[i])] = _to_str(command[i + 1])
+    
+                    return self._handle_write_multi(key, fields)
             elif cmd == 'DEL':
                 if len(command) < 2:
                     return self.encode_error("ERR wrong number of arguments")
@@ -400,41 +410,109 @@ class TieredCacheProxy:
             return False
 
     def _handle_write(self, key, field, value):
-        # FIX #1: Write MongoDB trước (source of truth)
+        """
+        Tách Network I/O và CPU ra khỏi Global Lock của TierManager.
+        """
         try:
-            self.collection.update_one({'_id': key}, {'$set': {field: value}}, upsert=True)
+            # ==================================================
+            # BƯỚC 1: SNAPSHOT (Lock-free hoặc Lock cực ngắn)
+            # ==================================================
+            # Giả định classify_tier hoặc get_tier đã tự xử lý thread-safe nội bộ
+            current_tier = self.tier_manager.get_tier(key)
+            
+            new_size = 0
+            final_tier = current_tier
+
+            # ==================================================
+            # BƯỚC 2: REDIS I/O & NÉN DATA (KHÔNG GIỮ LOCK)
+            # ==================================================
+            if current_tier == 'hot':
+                # Ghi thẳng xuống Redis
+                self.redis_client.hset(f"data:hot:{key}", field, str(value))
+                
+                # Ước lượng dung lượng tăng thêm (tránh gọi HGETALL đếm lại gây tốn RTT)
+                # Kích thước cũ + byte của field mới + byte của value mới
+                added_bytes = len(str(field).encode('utf-8')) + len(str(value).encode('utf-8'))
+                
+                # Lấy size hiện tại an toàn
+                current_size = self.tier_manager.key_stats.get(key, {}).get('size', 0)
+                new_size = current_size + added_bytes
+                
+            elif current_tier == 'cold':
+                compressed_data = self.redis_client.get(f"data:cold:{key}")
+                if compressed_data:
+                    # Tác vụ nặng CPU: Giải nén & Nén lại (Tuyệt đối không giữ lock!)
+                    hash_data = self.compressor.decompress(compressed_data)
+                    hash_data[field] = str(value)
+                    new_compressed = self.compressor.compress(hash_data)
+                    
+                    # Network I/O
+                    self.redis_client.set(f"data:cold:{key}", new_compressed)
+                    new_size = len(new_compressed)
+                else:
+                    # Fallback: Key bị miss hoặc đã bị xóa ở COLD, tạo mới trên HOT
+                    self.redis_client.hset(f"data:hot:{key}", field, str(value))
+                    final_tier = 'hot'
+                    new_size = len(str(field).encode('utf-8')) + len(str(value).encode('utf-8'))
+
+            # ==================================================
+            # BƯỚC 3: CẬP NHẬT TRẠNG THÁI (Giao phó cho TierManager tự lock)
+            # ==================================================
+            if final_tier != current_tier:
+                self.tier_manager.update_tier(key, final_tier)
+                
+            self.tier_manager.set_key_size(key, new_size)
+            self.tier_manager.record_access(key, new_size)
+            
+            # Kích hoạt dọn dẹp nếu dung lượng vượt ngưỡng
+            self._check_and_evict_if_needed(final_tier)
+            return self.encode_integer(1)
+
+        except Exception as e:
+            print(f"Write error on {key}: {e}")
+
+    def _handle_write_multi(self, key, fields: dict):
+        """Xử lý HMSET — ghi nhiều field/value vào một key."""
+        # Write MongoDB trước (source of truth)
+        try:
+            self.collection.update_one(
+                {'_id': key},
+                {'$set': fields},
+                upsert=True
+            )
         except PyMongoError as e:
             return self.encode_error(f"ERR mongodb write failed: {str(e)}")
 
-        # FIX #1: Snapshot tier TRONG lock của tier_manager để tránh race condition
-        # với PromotionWorker đang chạy song song
-        with self.tier_manager.lock:
-            current_tier = self.tier_manager.key_stats[key]['tier']
-            tier_key = f"data:{current_tier}:{key}"
+        current_tier = self.tier_manager.get_tier(key)
 
-            if current_tier == 'cold':
-                compressed = self.redis_client.get(tier_key)
-                if compressed:
-                    hash_data = self.compressor.decompress(compressed)
-                    hash_data[field] = value
-                else:
-                    hash_data = {field: value}
-                compressed = self.compressor.compress(hash_data)
-                self.redis_client.set(tier_key, compressed)
-                size = len(compressed)
+        if current_tier == 'hot':
+            # HSET nhiều field trong 1 pipeline
+            pipe = self.redis_client.pipeline()
+            for f, v in fields.items():
+                pipe.hset(f"data:hot:{key}", f, str(v))
+            pipe.execute()
+            cached_size = self.size_cache.get(key) or 0
+            added = sum(len(f.encode()) + len(str(v).encode()) for f, v in fields.items())
+            new_size = cached_size + added
+
+        else:  # cold
+            compressed_data = self.redis_client.get(f"data:cold:{key}")
+            if compressed_data:
+                hash_data = self.compressor.decompress(compressed_data)
+                hash_data.update(fields)
             else:
-                self.redis_client.hset(tier_key, field, value)
-                # Không fetch lại toàn bộ hash chỉ để estimate size —
-                # dùng size đã cache hoặc tính delta nhỏ
-                cached_size = self.size_cache.get(key)
-                size = (cached_size or 0) + len(field.encode()) + len(value.encode())
+                hash_data = dict(fields)
+            new_compressed = self.compressor.compress(hash_data)
+            self.redis_client.set(f"data:cold:{key}", new_compressed)
+            new_size = len(new_compressed)
 
-            self.size_cache.delete(key)  # Invalidate size cache khi dữ liệu thay đổi
-
-        self.tier_manager.record_access(key, size)
+        self.size_cache.delete(key)
+        self.tier_manager.set_key_size(key, new_size)
+        self.tier_manager.record_access(key, new_size)
         self._check_and_evict_if_needed(current_tier)
-        return self.encode_integer(1)
 
+        # HMSET trả về "+OK" theo RESP protocol
+        return self.encode_simple_string("OK")
     def _handle_delete(self, keys):
         count = 0
         for key in keys:

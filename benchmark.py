@@ -15,7 +15,7 @@ class TieredCacheBenchmark:
         self.OPERATION_COUNT = 500000
         self.WORKLOAD_TYPE = 'C'
         self.COMPRESSION_ALGORITHM = 'lz4'
-        self.HOT_MEMORY_PERCENT = 10
+        self.HOT_MEMORY_PERCENT = 12
         self.TOTAL_MEMORY_MB = 200
         
         script_dir = os.path.dirname(os.path.abspath(__file__))
